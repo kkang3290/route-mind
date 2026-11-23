@@ -1,0 +1,28 @@
+# Replace upstream IDs and set all referenced secrets before use.
+# A production reverse proxy must terminate TLS; never publish this port directly.
+server:
+  address: 0.0.0.0:8000
+  request_seconds: 180
+principals:
+  - id: application
+    key_env: GATEWAY_API_KEY
+    allow_agent: true
+    models: [small, strong]
+    providers: [openai, anthropic]
+    server_tools: []
+providers:
+  - {id: openai, format: openai, base_url: https://api.openai.com/v1, key_env: OPENAI_API_KEY}
+  - {id: anthropic, format: anthropic, base_url: https://api.anthropic.com/v1, key_env: ANTHROPIC_API_KEY}
+models:
+  - {id: decision, provider: openai, upstream: YOUR_DECISION_MODEL_ID, max_input_bytes: 131072, max_output_tokens: 4096}
+  - {id: small, provider: openai, upstream: YOUR_SMALL_MODEL_ID, max_input_bytes: 131072, max_output_tokens: 4096, stream: true, tools: true, forced_tools: true, cost_rank: 1, quality_tier: 1}
+  - {id: strong, provider: anthropic, upstream: YOUR_STRONG_MODEL_ID, max_input_bytes: 262144, max_output_tokens: 4096, stream: true, tools: true, forced_tools: true, cost_rank: 10, quality_tier: 3}
+agent:
+  decision_model: decision
+  models: [small, strong]
+  providers: [openai, anthropic]
+database:
+  url_env: DATABASE_URL
+  schema: public
+  allow_insecure: false
+  max_connections: 16

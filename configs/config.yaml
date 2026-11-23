@@ -1,0 +1,55 @@
+# Offline demonstration; ONLY local deterministic mock calls, no paid LLM calls.
+server:
+  address: 127.0.0.1:8000
+  allow_insecure_local: false
+  max_body_bytes: 1048576
+  request_seconds: 180
+  write_seconds: 15
+  max_concurrent: 32
+  per_principal_concurrent: 4
+  rate_per_minute: 60
+  burst: 10
+principals:
+  - id: local-user
+    key_env: GATEWAY_API_KEY
+    allow_agent: true
+    models: [small, strong]
+    providers: [mock-openai, mock-anthropic]
+    server_tools: [sum, lookup]
+providers:
+  - id: mock-openai
+    format: openai
+    base_url: http://127.0.0.1:18081/v1
+    key_env: MOCK_API_KEY
+    allow_http: true
+  - id: mock-anthropic
+    format: anthropic
+    base_url: http://127.0.0.1:18081/v1
+    key_env: MOCK_API_KEY
+    allow_http: true
+models:
+  - {id: decision, provider: mock-openai, upstream: mock-decision, max_input_bytes: 262144, max_output_tokens: 4096}
+  - {id: small, provider: mock-openai, upstream: mock-small, max_input_bytes: 131072, max_output_tokens: 4096, stream: true, tools: true, forced_tools: true, cost_rank: 1, quality_tier: 1}
+  - {id: strong, provider: mock-anthropic, upstream: mock-strong, max_input_bytes: 262144, max_output_tokens: 4096, stream: true, tools: true, forced_tools: true, cost_rank: 10, quality_tier: 3}
+agent:
+  decision_model: decision
+  models: [small, strong]
+  providers: [mock-openai, mock-anthropic]
+  limits:
+    max_steps: 6
+    max_calls: 16
+    max_reserved_output: 12288
+    work_tokens: 1024
+    decision_tokens: 256
+    final_tokens: 2048
+    deadline_seconds: 180
+    tool_seconds: 3
+    max_history_bytes: 262144
+    retention_seconds: 86400
+database:
+  url_env: DATABASE_URL
+  schema: public
+  allow_insecure: true # Development only. Production requires sslmode=verify-full.
+  max_connections: 16
+  max_runs: 4096
+  max_runs_per_principal: 128

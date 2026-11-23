@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+bin/
+coverage.out
+*.test
+*.log
+.DS_Store
+.claude/

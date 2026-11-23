@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+bin
+*.log
+coverage.out
+.claude
