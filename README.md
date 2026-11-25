@@ -7,6 +7,7 @@
 - **可替换决策器**：`pkg/agent.Decider`，内置 LLMDecider 和受约束 RuleDecider fallback；可从外部 Go 程序直接使用 Provider、Gateway、Engine。
 - **两类工具**：客户端工具暂停/恢复，服务端显式注册工具，以及混合批次。仅内置纯函数 `sum` 和固定本地词典 `lookup`，没有 shell/任意 URL 抓取。
 - **PostgreSQL**：原生 Run、预算、步骤用量、工具 journal、幂等记录；等待工具时可跨重启恢复，执行中的外部调用不自动重跑。
+- **可选 Redis 多实例协调**：共享主体 token、入口/上游并发和 Provider 熔断；独立租约续期、单半开探针、故障 fail closed，默认 local 无需 Redis。
 - **独立迁移管理**：嵌入式版本 SQL、SHA-256 清单与 Git 历史校验、advisory lock、dirty 阻断、只读启动检查、独立 DDL 身份。
 
 > 当前是有明确边界的核心 MVP，不是计费平台、代码沙箱或完整 HA 系统。默认演示只访问本机确定性 mock，**不会调用真实付费模型**；mock 的路由脚本只证明控制流，不证明模型质量或成本收益。
@@ -106,10 +107,10 @@ curl -fsS "http://127.0.0.1:8000/v1/agent/runs/$RUN_ID/tool-results" \
 | `GET /v1/agent/runs/{id}` | 主体隔离的白名单快照 |
 | `DELETE /v1/agent/runs/{id}` | 精确 If-Match revision，删除本人无活动 operation 的任务及关联数据 |
 | `POST /v1/agent/runs/{id}/tool-results` | 版本校验、完整批次提交及继续执行 |
-| `GET /healthz`, `GET /readyz` | 存活/数据库 Schema 就绪 |
+| `GET /healthz`, `GET /readyz` | 本地存活 / 数据库 Schema 与可选 Redis 策略就绪 |
 | `GET /metrics` | 认证后的进程内 Prometheus 文本指标 |
 
-[协议支持与差异](docs/api-compatibility.md) · [框架架构及扩展](docs/architecture.md) · [迁移运维](docs/database-migrations.md) · [测试指南](docs/verification.md)
+[协议支持与差异](docs/api-compatibility.md) · [框架架构及扩展](docs/architecture.md) · [多实例协调](docs/multi-instance.md) · [迁移运维](docs/database-migrations.md) · [测试指南](docs/verification.md)
 
 ## 真实 Provider / 容器
 
@@ -140,10 +141,20 @@ export TEST_DATABASE_URL='postgres://test_admin:YOUR_TEST_PASSWORD@127.0.0.1:543
 make integration           # PostgreSQL + HTTP + restart/idempotency + race
 ```
 
-集成测试需要测试库管理员能创建临时 Schema/角色；每个测试仅清理自己创建的资源。没有 TEST_DATABASE_URL 时命令明确失败，不把跳过当作通过。CI 同样提供独立 PostgreSQL 服务。
+集成测试需要测试库管理员能创建临时 Schema/角色；每个测试仅清理自己创建的资源。没有 TEST_DATABASE_URL 时命令明确失败，不把跳过当作通过。可选 Redis 验证：
+
+```sh
+export TEST_REDIS_URL='redis://127.0.0.1:6379/0' # 专用可销毁服务，不回退 REDIS_URL
+make coordination-integration # 真实 Redis + race，无需 PostgreSQL
+make integration-all          # 两种依赖的组合集成测试
+# 专用测试库先由独立 migration 身份 up；烟测不接收迁移凭据：
+make coordination-smoke       # 双进程 + curl + 断连/强杀/TTL，仅本地 mock
+```
+
+生产配置及本机双副本演示见[多实例协调](docs/multi-instance.md)。CI 提供隔离 PostgreSQL 和 Redis，默认 `make check` 仍不需要 Redis。
 
 ## 边界
 
-不支持 Responses API、多模态、私有 thinking/reasoning 块、全字段无损兼容；不提供后台自动接管、Exactly-once 外部副作用、SSE 重放、分布式配额或自动计费。限流/熔断为单进程策略，多副本需要外置统一控制。未知上游 usage 明确为未知，输出额度预留不是精确费用上限。原生 Run 存储任务内容，应按数据分类配置保留期、限制数据库访问并制定备份删除策略。
+不支持 Responses API、多模态、私有 thinking/reasoning 块、全字段无损兼容；不提供后台自动接管、Exactly-once 外部副作用、SSE 重放或自动计费。默认限流/熔断为单进程策略；可选 Redis 提供共享分布式配额，但不构成完整 HA 调度系统，也不保证所有分区/故障切换下远端物理在途数绝不超额。未知上游 usage 明确为未知，输出额度预留不是精确费用上限。原生 Run 存储任务内容，应按数据分类配置保留期、限制数据库访问并制定备份删除策略。
 
 Apache-2.0，见 [LICENSE](LICENSE)。

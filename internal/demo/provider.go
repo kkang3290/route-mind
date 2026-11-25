@@ -31,7 +31,7 @@ func Handler() http.Handler {
 			w.WriteHeader(405)
 			return
 		}
-		if r.Header.Get("Authorization") != "Bearer local-mock-only" && r.Header.Get("x-api-key") != "local-mock-only" {
+		if !mockAuthorized(r) {
 			w.WriteHeader(401)
 			return
 		}

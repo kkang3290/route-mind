@@ -50,11 +50,13 @@ waiting Run 在重启后可恢复，继续原绝对 deadline 和累计预算；�
 
 ## 可靠性与资源
 
-入口 active request 槽（默认 32、每主体 4）与 Gateway 上游槽（全局 32、每 Provider 8）独立。等待客户端工具不占活跃槽。主体 token-bucket 默认 60 请求/分钟、突发 10；全部进程内，绝不宣称分布式配额。默认 fail-fast，不排无界队列。
+入口 active request 槽（默认 32、每主体 4）与 Gateway 上游槽（全局 32、每 Provider 8）独立。等待客户端工具不占活跃槽。主体 token-bucket 默认 60 请求/分钟、突发 10；默认 `coordination.mode: local` 仅进程内有效。可选 `redis` 将这些业务额度改为 namespace 下的集群共享额度，每进程只保留有限硬保护。默认 fail-fast，不排无界队列，详见[多实例协调](multi-instance.md)。
+
+`pkg/llm.AttemptController` / `Permit` 是框架窄接口，不依赖 Redis。应用通过 `internal/reliability.Admission` 和 `internal/data/redis` 注入入口/上游两个独立资源池；每 attempt 均在 Before 前获取、Before 后再验证，完成/协调失败仍配对 After 并保留用量和预算。协调/容量/熔断错误显式标记为控制错误，不进入 RuleDecider fallback。Redis 不存 Run 内容或执行权，不改变 PostgreSQL 的 CAS 和禁止自动接管语义。
 
 上游有连接/TLS/响应头/流空闲超时；请求和 Run 有总 deadline；SSE 写有重置的 write deadline。Kratos 显式 Timeout(0)，避免默认 1 秒截断；原生 HTTP 路由也经过共同认证、恢复、限额和安全头，ResponseWriter 保留 Unwrap/Flush 能力。输出后不再重试或切换 Provider。
 
-重试仅限明确 transient、无任何流事件的失败；应用默认最多一次重试，受 Retry-After、退避/jitter 和请求 deadline 约束。连续上游服务端错误触发 Provider 级进程内熔断，默认五次/15 秒冷却。直连不跨模型自动降级。
+重试仅限明确 transient、无任何流事件的失败；应用默认最多一次重试，受 Retry-After、退避/jitter 和请求 deadline 约束。连续上游服务端错误触发 Provider 级熔断，默认五次/15 秒冷却。local 为进程内状态；Redis 模式共享状态及唯一半开探针，以不可复用 epoch 拦截迟到旧结果，下游取消/写失败和上游认证/限流不计健康失败。直连不跨模型自动降级。
 
 应用关闭时停止接收并取消在途请求，最多等待 Kratos 10 秒；关闭维护协程、idle HTTP 连接及数据库 pool。挂起任务不绑定已结束请求 context。
 

@@ -249,6 +249,9 @@ func (h *Handler) advanceRun(w http.ResponseWriter, r *http.Request, run *agent.
 		}
 	}
 	err := h.app.Engine.Advance(r.Context(), run, sink, func(ctx context.Context, r *agent.Run) error { return h.app.Store.Save(ctx, r) })
+	if err == nil {
+		err = llm.ContextError(r.Context())
+	}
 	if err != nil {
 		if lazy.started {
 			h.streamFailed(w, r, err)

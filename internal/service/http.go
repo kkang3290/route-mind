@@ -21,6 +21,7 @@ import (
 
 	"github.com/kkang3290/route-mind/internal/biz"
 	"github.com/kkang3290/route-mind/internal/config"
+	"github.com/kkang3290/route-mind/internal/reliability"
 	"github.com/kkang3290/route-mind/pkg/agent"
 	"github.com/kkang3290/route-mind/pkg/llm"
 	"github.com/kkang3290/route-mind/pkg/llm/protocol"
@@ -31,29 +32,28 @@ type Credential struct {
 	Key string
 }
 type Options struct {
-	Server     config.Server
-	Principals []Credential
-	Logger     *slog.Logger
+	Admission           reliability.Admission
+	CoordinationMetrics func(io.Writer)
+	Server              config.Server
+	Principals          []Credential
+	Logger              *slog.Logger
 }
 type Dependencies = biz.Application
-type bucket struct {
-	tokens float64
-	at     time.Time
-	active int
-}
 type Handler struct {
 	options                                                   Options
 	app                                                       Dependencies
 	mux                                                       *http.ServeMux
 	slots                                                     chan struct{}
-	mu                                                        sync.Mutex
-	buckets                                                   map[string]*bucket
+	admission, metricsAdmission                               reliability.Admission
 	requests, failures, elapsed, firstTokens, firstTokenNanos atomic.Int64
 }
 type principalKey struct{}
 type responseWriter struct {
 	http.ResponseWriter
-	status int
+	status         int
+	ioMu           sync.Mutex
+	requestContext context.Context
+	streamActive   bool
 }
 
 func (w *responseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -77,7 +77,7 @@ func New(o Options, a Dependencies) (http.Handler, error) {
 		o.Server.MaxConcurrent = 32
 	}
 	if o.Server.PerPrincipalConcurrent <= 0 {
-		o.Server.PerPrincipalConcurrent = 4
+		o.Server.PerPrincipalConcurrent = min(4, o.Server.MaxConcurrent)
 	}
 	if o.Server.MaxBodyBytes <= 0 {
 		o.Server.MaxBodyBytes = 1 << 20
@@ -114,7 +114,15 @@ func New(o Options, a Dependencies) (http.Handler, error) {
 		ids[p.ID] = true
 	}
 	a.Policy.Limits = agent.NormalizeLimits(a.Policy.Limits)
-	h := &Handler{options: o, app: a, mux: http.NewServeMux(), slots: make(chan struct{}, o.Server.MaxConcurrent), buckets: map[string]*bucket{}}
+	local, err := reliability.NewLocalAdmission(o.Server.MaxConcurrent, o.Server.PerPrincipalConcurrent, o.Server.RatePerMinute, o.Server.Burst)
+	if err != nil {
+		return nil, err
+	}
+	backend := o.Admission
+	if backend == nil {
+		backend = local
+	}
+	h := &Handler{options: o, app: a, mux: http.NewServeMux(), slots: make(chan struct{}, o.Server.MaxConcurrent), admission: backend, metricsAdmission: local}
 	h.mux.HandleFunc("/v1/chat/completions", h.compat("openai"))
 	h.mux.HandleFunc("/v1/messages", h.compat("anthropic"))
 	h.mux.HandleFunc("/v1/models", h.models)
@@ -178,7 +186,7 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 			defer cancel()
 			if e := h.app.Ready(ctx); e != nil {
-				writeError(w, format(r), llm.Failure("not_ready", "service not ready; verify database and migrations", 503))
+				writeError(w, format(r), llm.Failure("not_ready", "service dependencies unavailable or incompatible", 503))
 				return
 			}
 		}
@@ -191,21 +199,41 @@ func (h *Handler) ServeHTTP(raw http.ResponseWriter, r *http.Request) {
 		writeError(w, format(r), e)
 		return
 	}
-	release, e := h.admit(p.ID)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(h.options.Server.RequestSeconds)*time.Second)
+	defer cancel()
+	select {
+	case h.slots <- struct{}{}:
+	default:
+		writeError(w, format(r), &llm.Error{Control: true, Code: "overloaded", Message: "local request capacity reached", Status: 503, RetryAfter: "1"})
+		return
+	}
+	defer func() { <-h.slots }()
+	backend := h.admission
+	if r.URL.Path == "/metrics" {
+		backend = h.metricsAdmission
+	}
+	permit, e := backend.Acquire(ctx, p.ID)
 	if e != nil {
-		w.Header().Set("Retry-After", "1")
 		writeError(w, format(r), e)
 		return
 	}
-	defer release()
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(h.options.Server.RequestSeconds)*time.Second)
-	defer cancel()
-	ctx = context.WithValue(ctx, principalKey{}, p)
-	// Context cancellation alone does not unblock net/http Body.Read. Bound the
-	// socket read too, without a whole-response timeout that would kill SSE.
+	defer func() {
+		if err := permit.Complete(llm.AttemptOutcome{Kind: llm.OutcomeNeutral}); err != nil && h.options.Logger != nil {
+			h.options.Logger.Warn("request_lease_release_failed", "code", llm.AsError(err).Code)
+		}
+	}()
+	ctx = context.WithValue(permit.Context(), principalKey{}, p)
+	w.requestContext = ctx
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = http.NewResponseController(w).SetReadDeadline(deadline)
 	}
+	interrupted := make(chan struct{})
+	stopInterrupt := context.AfterFunc(ctx, func() { defer close(interrupted); w.interruptIO() })
+	defer func() {
+		if !stopInterrupt() {
+			<-interrupted
+		}
+	}()
 	h.mux.ServeHTTP(w, r.WithContext(ctx))
 }
 func (h *Handler) authenticate(r *http.Request) (config.Principal, error) {
@@ -237,31 +265,32 @@ func (h *Handler) authenticate(r *http.Request) (config.Principal, error) {
 	}
 	return config.Principal{}, llm.Failure("unauthorized", "missing or invalid API credential", 401)
 }
-func (h *Handler) admit(id string) (func(), error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	now := time.Now()
-	b := h.buckets[id]
-	if b == nil {
-		b = &bucket{tokens: float64(h.options.Server.Burst), at: now}
-		h.buckets[id] = b
+
+// interruptIO and SetWriteDeadline serialize deadline changes, not the
+// potentially blocking Write itself. A cancelled stream cannot extend its own
+// deadline again, and an unread request can still receive a JSON 503 response.
+func (w *responseWriter) interruptIO() {
+	w.ioMu.Lock()
+	defer w.ioMu.Unlock()
+	rc := http.NewResponseController(w.ResponseWriter)
+	_ = rc.SetReadDeadline(time.Now())
+	if w.streamActive {
+		_ = rc.SetWriteDeadline(time.Now())
 	}
-	b.tokens += now.Sub(b.at).Seconds() * float64(h.options.Server.RatePerMinute) / 60
-	if b.tokens > float64(h.options.Server.Burst) {
-		b.tokens = float64(h.options.Server.Burst)
+}
+func (w *responseWriter) SetWriteDeadline(deadline time.Time) error {
+	w.ioMu.Lock()
+	defer w.ioMu.Unlock()
+	if w.requestContext != nil {
+		if err := llm.ContextError(w.requestContext); err != nil {
+			return err
+		}
 	}
-	b.at = now
-	if b.tokens < 1 || b.active >= h.options.Server.PerPrincipalConcurrent {
-		return nil, llm.Failure("rate_limited", "principal rate or concurrency limit reached", 429)
+	err := http.NewResponseController(w.ResponseWriter).SetWriteDeadline(deadline)
+	if err == nil || errors.Is(err, http.ErrNotSupported) {
+		w.streamActive = true
 	}
-	select {
-	case h.slots <- struct{}{}:
-	default:
-		return nil, llm.Failure("overloaded", "active request capacity reached", 503)
-	}
-	b.tokens--
-	b.active++
-	return func() { <-h.slots; h.mu.Lock(); b.active--; h.mu.Unlock() }, nil
+	return err
 }
 func method(w http.ResponseWriter, r *http.Request, want string) bool {
 	if r.Method != want {
@@ -278,6 +307,9 @@ func readBody(w http.ResponseWriter, r *http.Request, max int) ([]byte, error) {
 	}
 	b, e := io.ReadAll(http.MaxBytesReader(w, r.Body, int64(max)))
 	if e != nil {
+		if cause := llm.ContextError(r.Context()); cause != nil {
+			return nil, cause
+		}
 		var limit *http.MaxBytesError
 		if errors.As(e, &limit) {
 			return nil, llm.Failure("request_too_large", "request body exceeds limit", 413)
@@ -336,6 +368,9 @@ func (h *Handler) compat(f string) http.HandlerFunc {
 			lazy.at = time.Now()
 		}
 		out, e := h.app.Execute(r.Context(), p, req, sink)
+		if e == nil {
+			e = llm.ContextError(r.Context())
+		}
 		if e != nil {
 			if lazy.started {
 				h.streamFailed(w, r, e)
@@ -391,6 +426,9 @@ func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
 	}
 	m := &h.app.Gateway.Metrics
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	if h.options.CoordinationMetrics != nil {
+		h.options.CoordinationMetrics(w)
+	}
 	_, _ = fmt.Fprintf(w, "route_mind_http_requests_total %d\nroute_mind_http_errors_total %d\nroute_mind_http_duration_seconds_sum %g\nroute_mind_first_token_seconds_sum %g\nroute_mind_first_token_seconds_count %d\nroute_mind_upstream_attempts_total %d\nroute_mind_upstream_retries_total %d\nroute_mind_upstream_errors_total %d\nroute_mind_upstream_inflight %d\n", h.requests.Load(), h.failures.Load(), float64(h.elapsed.Load())/1e9, float64(h.firstTokenNanos.Load())/1e9, h.firstTokens.Load(), m.Attempts.Load(), m.Retries.Load(), m.Errors.Load(), m.Inflight.Load())
 	_, _ = fmt.Fprintf(w, "route_mind_reported_input_tokens_total %d\nroute_mind_reported_output_tokens_total %d\nroute_mind_unknown_usage_attempts_total %d\nroute_mind_model_calls_total{phase=\"decision\"} %d\nroute_mind_model_calls_total{phase=\"work\"} %d\nroute_mind_model_calls_total{phase=\"respond\"} %d\nroute_mind_model_calls_total{phase=\"direct\"} %d\n", m.InputTokens.Load(), m.OutputTokens.Load(), m.UnknownUsage.Load(), m.DecisionCalls.Load(), m.WorkCalls.Load(), m.RespondCalls.Load(), m.DirectCalls.Load())
 }

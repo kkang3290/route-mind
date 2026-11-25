@@ -1,4 +1,4 @@
-name: Go and PostgreSQL
+name: Go, PostgreSQL and Redis
 on:
   push:
   pull_request:
@@ -17,7 +17,15 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres -d route_mind_test"
           --health-interval 2s --health-timeout 3s --health-retries 30
+      redis:
+        image: redis:7.4.8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --memory 128m
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 3s --health-retries 30
     env:
+      TEST_REDIS_URL: redis://127.0.0.1:6379/0
       TEST_DATABASE_URL: postgres://postgres:ci-disposable-only@127.0.0.1:5432/route_mind_test?sslmode=disable
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -28,11 +36,13 @@ jobs:
       - name: Formatting
         run: test -z "$(gofmt -l .)"
       - run: make test race vet build
-      - run: make integration
+      - run: make integration-all
       - name: Real binary, curl, and process-restart smoke (local mock only)
         run: |
           MIGRATION_DATABASE_URL="$TEST_DATABASE_URL" go run ./cmd/migrate up
           python3 -I scripts/smoke.py
+      - name: Two gateway processes, shared quotas and Redis outage (local mock only)
+        run: make coordination-smoke
       - name: Verify migration contents and immutable history
         env:
           PR_BASE: ${{ github.event.pull_request.base.sha }}

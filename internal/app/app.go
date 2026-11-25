@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/kkang3290/route-mind/internal/config"
 	"github.com/kkang3290/route-mind/internal/data/postgres"
+	rediscoordination "github.com/kkang3290/route-mind/internal/data/redis"
 	"github.com/kkang3290/route-mind/internal/migration"
 	"github.com/kkang3290/route-mind/internal/server"
 	"github.com/kkang3290/route-mind/internal/tools"
@@ -25,12 +26,13 @@ import (
 )
 
 type Runtime struct {
-	HTTP      *kratoshttp.Server
-	pool      *pgxpool.Pool
-	providers []*transport.Client
-	cancel    context.CancelFunc
-	done      chan struct{}
-	once      sync.Once
+	HTTP         *kratoshttp.Server
+	pool         *pgxpool.Pool
+	providers    []*transport.Client
+	coordination *rediscoordination.Coordinator
+	cancel       context.CancelFunc
+	done         chan struct{}
+	once         sync.Once
 }
 
 func Open(parent context.Context, r *config.Runtime, logger *slog.Logger) (runtime *Runtime, resultErr error) {
@@ -42,6 +44,9 @@ func Open(parent context.Context, r *config.Runtime, logger *slog.Logger) (runti
 	defer func() {
 		if resultErr != nil {
 			cancel()
+			if runtime.coordination != nil {
+				_ = runtime.coordination.Close()
+			}
 			if runtime.pool != nil {
 				runtime.pool.Close()
 			}
@@ -94,7 +99,20 @@ func Open(parent context.Context, r *config.Runtime, logger *slog.Logger) (runti
 		providers[p.ID] = client
 		runtime.providers = append(runtime.providers, client)
 	}
-	gateway, e := llm.NewGateway(r.Catalog, providers, llm.GatewayOptions{MaxConcurrent: 32, ProviderConcurrent: 8, Retries: 1, CircuitFailures: 5, CircuitCooldown: 15 * time.Second})
+	gatewayOptions := llm.GatewayOptions{MaxConcurrent: cfg.Gateway.MaxConcurrent, ProviderConcurrent: cfg.Gateway.ProviderConcurrent, Retries: cfg.Gateway.Retries, CircuitFailures: cfg.Gateway.CircuitFailures, CircuitCooldown: time.Duration(cfg.Gateway.CircuitCooldownSeconds) * time.Second}
+	if cfg.Coordination.Mode == "redis" {
+		identities := make([]rediscoordination.ProviderIdentity, 0, len(cfg.Providers))
+		for _, p := range cfg.Providers {
+			identities = append(identities, rediscoordination.ProviderIdentity{ID: p.ID, Format: p.Format, Endpoint: p.BaseURL})
+		}
+		policy := rediscoordination.Policy{RequestLimit: cfg.Server.MaxConcurrent, PrincipalLimit: cfg.Server.PerPrincipalConcurrent, RatePerMinute: cfg.Server.RatePerMinute, Burst: cfg.Server.Burst, UpstreamLimit: cfg.Gateway.MaxConcurrent, ProviderLimit: cfg.Gateway.ProviderConcurrent, CircuitFailures: cfg.Gateway.CircuitFailures, CircuitCooldown: gatewayOptions.CircuitCooldown, Providers: identities}
+		runtime.coordination, e = rediscoordination.New(ctx, r.RedisURL, cfg.Coordination, policy)
+		if e != nil {
+			return runtime, e
+		}
+		gatewayOptions.Controller = runtime.coordination.Upstream()
+	}
+	gateway, e := llm.NewGateway(r.Catalog, providers, gatewayOptions)
 	if e != nil {
 		return runtime, e
 	}
@@ -114,11 +132,22 @@ func Open(parent context.Context, r *config.Runtime, logger *slog.Logger) (runti
 	for _, p := range cfg.Principals {
 		credentials = append(credentials, server.Credential{Principal: p, Key: r.Keys[p.ID]})
 	}
-	runtime.HTTP, e = server.New(server.Options{Server: cfg.Server, Principals: credentials, Logger: logger}, server.Dependencies{Catalog: r.Catalog, Gateway: gateway, Engine: engine, Tools: registry, Store: store, Policy: cfg.Agent, Ready: func(c context.Context) error {
+	httpOptions := server.Options{Server: cfg.Server, Principals: credentials, Logger: logger}
+	if runtime.coordination != nil {
+		httpOptions.Admission = runtime.coordination.Admission()
+		httpOptions.CoordinationMetrics = runtime.coordination.WriteMetrics
+	}
+	runtime.HTTP, e = server.New(httpOptions, server.Dependencies{Catalog: r.Catalog, Gateway: gateway, Engine: engine, Tools: registry, Store: store, Policy: cfg.Agent, Ready: func(c context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return migration.CheckSchema(c, runtime.pool, cfg.Database.Schema)
+		if err := migration.CheckSchema(c, runtime.pool, cfg.Database.Schema); err != nil {
+			return err
+		}
+		if runtime.coordination != nil {
+			return runtime.coordination.Ready(c)
+		}
+		return nil
 	}})
 	if e != nil {
 		return runtime, e
@@ -146,6 +175,9 @@ func (r *Runtime) Close() {
 	r.once.Do(func() {
 		r.cancel()
 		<-r.done
+		if r.coordination != nil {
+			_ = r.coordination.Close()
+		}
 		for _, p := range r.providers {
 			p.Close()
 		}

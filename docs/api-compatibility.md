@@ -89,4 +89,4 @@ OpenAI 未提供输出限制时默认 1024。auto 的最终输出还受 Agent fi
 
 OpenAI/原生 Bearer，Anthropic 支持 x-api-key；不允许混合冲突凭据。身份来自固定密钥配置而非请求体或转发 IP。模型列表按权限筛选，Run 访问带 owner 条件，非本人 404。
 
-400 输入/不支持语义；401 凭据；403 权限；404 资源；409 幂等/版本/契约冲突；413 体积；415 Content-Type；429 主体速率/预算；502 上游/工具；503 入口容量/存储/熔断；504 deadline。上游错误体与凭据不返回。请求返回服务端生成 X-Request-ID。未启用浏览器 CORS。
+400 输入/不支持语义；401 凭据；403 权限；404 资源；409 幂等/版本/契约冲突；413 体积；415 Content-Type；429 主体速率/预算；502 上游/工具；503 入口/上游容量、存储、熔断或 Redis 协调；504 deadline。Redis 模式的 `coordination_unavailable` / `coordination_policy_mismatch` / `lease_lost` 是终止控制错误，不触发 Agent 规则兜底或隐式重放；入口前拒绝不创建 Run，执行中失败则保留已预占预算和未知工具结果。已开始 SSE 时只能错误结束或断开，不改写已发出的 HTTP 状态。共享主体速率/活跃数 429，全局/Provider 容量 503，并提供有界 Retry-After。上游错误体与凭据不返回。请求返回服务端生成 X-Request-ID。未启用浏览器 CORS。

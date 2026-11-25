@@ -41,6 +41,7 @@ func WithObserver(c context.Context, o AttemptObserver) context.Context {
 }
 
 type GatewayOptions struct {
+	Controller         AttemptController
 	MaxConcurrent      int
 	ProviderConcurrent int
 	Retries            int
@@ -129,22 +130,69 @@ func (g *Gateway) invoke(ctx context.Context, r Request, sink Sink) (Response, e
 	}
 	var last error
 	for attempt := 0; attempt <= g.options.Retries; attempt++ {
-		if e := ctx.Err(); e != nil {
-			return Response{}, e
+		if ctx.Err() != nil {
+			return Response{}, context.Cause(ctx)
 		}
-		if g.open(m.Provider) {
-			return Response{}, Failure("circuit_open", "upstream circuit is open", 503)
+		if g.options.Controller == nil && g.open(m.Provider) {
+			return Response{}, &Error{Control: true, Code: "circuit_open", Message: "upstream circuit is open", Status: 503}
 		}
 		release, e := g.acquire(m.Provider)
 		if e != nil {
 			return Response{}, e
 		}
-		observer, _ := ctx.Value(observerKey{}).(AttemptObserver)
-		if observer != nil {
-			if e = observer.Before(ctx, r); e != nil {
+		defer release() // Idempotent; also protects custom Provider panics.
+		var permit Permit
+		callCtx := ctx
+		if g.options.Controller != nil {
+			permit, e = g.options.Controller.Acquire(ctx, m.Provider)
+			if e != nil {
 				release()
 				return Response{}, e
 			}
+			callCtx = permit.Context()
+		}
+		outcome := AttemptOutcome{Kind: OutcomeNeutral}
+		finish := sync.OnceValue(func() error {
+			if permit != nil {
+				return permit.Complete(outcome)
+			}
+			return nil
+		})
+		defer finish()
+		check := func() error {
+			if err := ContextError(callCtx); err != nil {
+				return err
+			}
+			if permit != nil {
+				return permit.Check()
+			}
+			return nil
+		}
+		observer, _ := ctx.Value(observerKey{}).(AttemptObserver)
+		if observer != nil {
+			if e = observer.Before(callCtx, r); e != nil {
+				// A checkpoint may return ctx.Err rather than the permit's cause.
+				// Keep storage/CAS failures authoritative, but never turn lease
+				// loss into an ordinary cancellation eligible for Agent fallback.
+				if code := AsError(e).Code; code != "storage_unavailable" && code != "conflict" {
+					if cause := ContextError(callCtx); cause != nil {
+						e = cause
+					}
+				}
+				_ = finish()
+				release()
+				return Response{}, e
+			}
+		}
+		if e = check(); e != nil {
+			_ = finish()
+			if observer != nil {
+				if oe := observer.After(ctx, r, Response{}, e); oe != nil {
+					e = oe
+				}
+			}
+			release()
+			return Response{}, e
 		}
 		g.Metrics.Attempts.Add(1)
 		switch r.Purpose {
@@ -160,12 +208,24 @@ func (g *Gateway) invoke(ctx context.Context, r Request, sink Sink) (Response, e
 		g.Metrics.Inflight.Add(1)
 		native := r
 		native.Model = m.Upstream
-		emitted := false
+		emitted, sinkFailed := false, false
 		var v Response
 		if sink == nil {
-			v, e = g.providers[m.Provider].Generate(ctx, native)
+			v, e = g.providers[m.Provider].Generate(callCtx, native)
 		} else {
-			v, e = g.providers[m.Provider].Stream(ctx, native, func(event Event) error { emitted = true; return sink(event) })
+			v, e = g.providers[m.Provider].Stream(callCtx, native, func(event Event) error {
+				if err := check(); err != nil {
+					return err
+				}
+				emitted = true
+				err := sink(event)
+				sinkFailed = sinkFailed || err != nil
+				return err
+			})
+		}
+		permitErr := check()
+		if permitErr != nil {
+			e = permitErr
 		}
 		g.Metrics.Inflight.Add(-1)
 		release()
@@ -184,11 +244,21 @@ func (g *Gateway) invoke(ctx context.Context, r Request, sink Sink) (Response, e
 		if !v.Usage.Known || e != nil {
 			g.Metrics.UnknownUsage.Add(1)
 		}
-		g.outcome(m.Provider, e)
+		outcome = classifyOutcome(e, sinkFailed || permitErr != nil)
+		outcome.Dispatched = true
+		if g.options.Controller == nil && outcome.Kind != OutcomeNeutral {
+			g.outcome(m.Provider, outcome.Kind)
+		}
+		if ce := finish(); ce != nil {
+			e = ce
+		}
 		if observer != nil {
 			if oe := observer.After(ctx, r, v, e); oe != nil {
 				return v, oe
 			}
+		}
+		if ce := ContextError(ctx); ce != nil {
+			e = ce
 		}
 		if e == nil {
 			return v, nil
@@ -196,7 +266,7 @@ func (g *Gateway) invoke(ctx context.Context, r Request, sink Sink) (Response, e
 		g.Metrics.Errors.Add(1)
 		last = e
 		var ue *Error
-		if emitted || attempt == g.options.Retries || !errors.As(e, &ue) || !ue.Retryable || ctx.Err() != nil {
+		if emitted || attempt == g.options.Retries || !errors.As(e, &ue) || !ue.Retryable || ue.Control || ctx.Err() != nil {
 			return v, e
 		}
 		delay := g.options.BaseBackoff * time.Duration(1<<attempt)
@@ -222,7 +292,7 @@ func (g *Gateway) invoke(ctx context.Context, r Request, sink Sink) (Response, e
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return v, ctx.Err()
+			return v, context.Cause(ctx)
 		case <-timer.C:
 		}
 		g.Metrics.Retries.Add(1)
@@ -233,14 +303,14 @@ func (g *Gateway) acquire(id string) (func(), error) {
 	select {
 	case g.slots <- struct{}{}:
 	default:
-		return nil, Failure("overloaded", "upstream concurrency limit reached", 503)
+		return nil, &Error{Control: true, Code: "overloaded", Message: "upstream concurrency limit reached", Status: 503, RetryAfter: "1"}
 	}
 	select {
 	case g.providerSlots[id] <- struct{}{}:
-		return func() { <-g.providerSlots[id]; <-g.slots }, nil
+		return sync.OnceFunc(func() { <-g.providerSlots[id]; <-g.slots }), nil
 	default:
 		<-g.slots
-		return nil, Failure("overloaded", "provider concurrency limit reached", 503)
+		return nil, &Error{Control: true, Code: "overloaded", Message: "provider concurrency limit reached", Status: 503, RetryAfter: "1"}
 	}
 }
 func (g *Gateway) open(id string) bool {
@@ -255,18 +325,14 @@ func (g *Gateway) open(id string) bool {
 	}
 	return false
 }
-func (g *Gateway) outcome(id string, e error) {
+func (g *Gateway) outcome(id string, kind OutcomeKind) {
 	if g.options.CircuitFailures <= 0 {
 		return
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if e == nil {
+	if kind == OutcomeSuccess {
 		g.circuits[id] = circuit{}
-		return
-	}
-	ue := AsError(e)
-	if ue.Status < 500 {
 		return
 	}
 	v := g.circuits[id]

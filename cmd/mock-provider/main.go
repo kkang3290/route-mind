@@ -16,6 +16,8 @@ import (
 
 func main() {
 	address := flag.String("address", "127.0.0.1:18081", "literal loopback listen address (development only)")
+	delay := flag.Duration("delay", 0, "bounded response delay, up to 60s (verification only)")
+	failFirst := flag.Int("fail-first", 0, "fail the first 0..1000 authenticated calls (verification only)")
 	flag.Parse()
 	host, _, e := net.SplitHostPort(*address)
 	ip := net.ParseIP(host)
@@ -25,7 +27,12 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	s := &http.Server{Addr: *address, Handler: demo.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
+	handler, e := demo.NewScenario(*delay, *failFirst)
+	if e != nil {
+		slog.Error("invalid mock verification settings")
+		os.Exit(1)
+	}
+	s := &http.Server{Addr: *address, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 70 * time.Second, MaxHeaderBytes: 16 << 10}
 	go func() {
 		<-ctx.Done()
 		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)

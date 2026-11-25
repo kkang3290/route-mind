@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/kkang3290/route-mind/internal/reliability"
 	"github.com/kkang3290/route-mind/internal/tools"
 	"github.com/kkang3290/route-mind/pkg/agent"
 	"github.com/kkang3290/route-mind/pkg/llm"
@@ -59,19 +60,30 @@ type Database struct {
 	MaxRuns             int    `yaml:"max_runs"`
 	MaxRunsPerPrincipal int    `yaml:"max_runs_per_principal"`
 }
+type Gateway struct {
+	MaxConcurrent          int `yaml:"max_concurrent"`
+	ProviderConcurrent     int `yaml:"provider_concurrent"`
+	Retries                int `yaml:"retries"`
+	CircuitFailures        int `yaml:"circuit_failures"`
+	CircuitCooldownSeconds int `yaml:"circuit_cooldown_seconds"`
+}
+
 type Config struct {
-	Server     Server      `yaml:"server"`
-	Principals []Principal `yaml:"principals"`
-	Providers  []Provider  `yaml:"providers"`
-	Models     []llm.Model `yaml:"models"`
-	Agent      Agent       `yaml:"agent"`
-	Database   Database    `yaml:"database"`
+	Coordination reliability.Settings `yaml:"coordination"`
+	Gateway      Gateway              `yaml:"gateway"`
+	Server       Server               `yaml:"server"`
+	Principals   []Principal          `yaml:"principals"`
+	Providers    []Provider           `yaml:"providers"`
+	Models       []llm.Model          `yaml:"models"`
+	Agent        Agent                `yaml:"agent"`
+	Database     Database             `yaml:"database"`
 }
 type Runtime struct {
 	Config       Config
 	Catalog      *llm.Catalog
 	Keys         map[string]string `json:"-" yaml:"-"`
 	ProviderKeys map[string]string `json:"-" yaml:"-"`
+	RedisURL     string            `json:"-" yaml:"-"`
 	DatabaseURL  string            `json:"-" yaml:"-"`
 }
 
@@ -103,7 +115,7 @@ func Load(path string, env func(string) string) (*Runtime, error) {
 	if e != nil || len(data) > 1<<20 {
 		return nil, fmt.Errorf("configuration unreadable or exceeds 1 MiB")
 	}
-	var c Config
+	c := Config{Coordination: reliability.DefaultSettings(), Gateway: Gateway{MaxConcurrent: 32, ProviderConcurrent: 8, Retries: 1, CircuitFailures: 5, CircuitCooldownSeconds: 15}}
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	if e = decoder.Decode(&c); e != nil {
@@ -143,6 +155,26 @@ func Load(path string, env func(string) string) (*Runtime, error) {
 		return nil, e
 	}
 	r := &Runtime{Catalog: catalog, Keys: map[string]string{}, ProviderKeys: map[string]string{}}
+	if err := c.Coordination.Validate(); err != nil {
+		return nil, err
+	}
+	g := c.Gateway
+	if g.MaxConcurrent < 1 || g.MaxConcurrent > 4096 || g.ProviderConcurrent < 1 || g.ProviderConcurrent > g.MaxConcurrent || g.Retries < 0 || g.Retries > 3 || g.CircuitFailures < 0 || g.CircuitFailures > 1000 || g.CircuitCooldownSeconds < 1 || g.CircuitCooldownSeconds > 300 {
+		return nil, fmt.Errorf("invalid gateway resource limits")
+	}
+	// Bound refill arithmetic and the amount of state an operator can reserve.
+	if s.Burst > 1000000 || s.RatePerMinute > 100000000 {
+		return nil, fmt.Errorf("server rate limits exceed supported bounds")
+	}
+	if c.Coordination.Mode == "redis" {
+		r.RedisURL, e = secret(env, c.Coordination.URLEnv)
+		if e != nil {
+			return nil, e
+		}
+		if e = reliability.ValidateRedisURL(r.RedisURL, c.Coordination.AllowInsecureLocal, env("APP_ENV") == "production"); e != nil {
+			return nil, e
+		}
+	}
 	providerIDs := map[string]bool{}
 	for _, p := range c.Providers {
 		if !identifier.MatchString(p.ID) || providerIDs[p.ID] || (p.Format != "openai" && p.Format != "anthropic") {

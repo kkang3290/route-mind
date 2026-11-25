@@ -1,4 +1,13 @@
 # Offline demonstration; ONLY local deterministic mock calls, no paid LLM calls.
+# Optional shared quotas: configs/redis.example.yaml; docs/multi-instance.md.
+coordination:
+  mode: local
+gateway:
+  max_concurrent: 32
+  provider_concurrent: 8
+  retries: 1
+  circuit_failures: 5
+  circuit_cooldown_seconds: 15
 server:
   address: 127.0.0.1:8000
   allow_insecure_local: false

@@ -96,6 +96,9 @@ type Provider interface {
 type Invoker = Provider
 
 type Error struct {
+	// Control marks an infrastructure authorization/capacity failure. It must
+	// terminate agent routing and must never trigger model retries or fallback.
+	Control    bool
 	Code       string
 	Message    string
 	Status     int

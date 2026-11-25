@@ -3,7 +3,7 @@ BASE_REF ?= HEAD
 NAME ?=
 STEPS ?= 1
 GOVULNCHECK_VERSION := v1.1.4
-.PHONY: test race integration vet build check mock run migration-new migration-checksum migration-verify migrate-status migrate-up migrate-down vuln
+.PHONY: test race integration coordination-integration integration-all coordination-smoke vet build check mock run migration-new migration-checksum migration-verify migrate-status migrate-up migrate-down vuln
 
 test:
 	$(GO) test ./...
@@ -12,6 +12,14 @@ race:
 integration:
 	@test -n "$$TEST_DATABASE_URL" || { printf '%s\n' 'TEST_DATABASE_URL must select a disposable *_test database'; exit 1; }
 	$(GO) test -race -tags=integration ./...
+coordination-integration:
+	@test -n "$$TEST_REDIS_URL" || { printf '%s\n' 'TEST_REDIS_URL must select a disposable Redis service'; exit 1; }
+	$(GO) test -race -tags=redis_integration ./...
+integration-all:
+	@test -n "$$TEST_DATABASE_URL" && test -n "$$TEST_REDIS_URL" || { printf '%s\n' 'TEST_DATABASE_URL and TEST_REDIS_URL are required'; exit 1; }
+	$(GO) test -race -tags=integration,redis_integration ./...
+coordination-smoke:
+	python3 -I scripts/smoke_coordination.py
 vet:
 	$(GO) vet ./...
 build:

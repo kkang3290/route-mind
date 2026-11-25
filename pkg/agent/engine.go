@@ -69,6 +69,13 @@ func (e *Engine) Advance(parent context.Context, r *Run, sink llm.Sink, checkpoi
 	}
 	defer func() {
 		if resultErr != nil {
+			// A canceled persistence operation can return context.Canceled rather
+			// than the infrastructure cause. Preserve storage/CAS failures, but
+			// do not label lease loss as a user cancellation or ordinary tool error.
+			code := llm.AsError(resultErr).Code
+			if cause := llm.ContextError(ctx); cause != nil && llm.AsError(cause).Control && code != "storage_unavailable" && code != "conflict" {
+				resultErr = cause
+			}
 			r.Status = "failed"
 			if errors.Is(resultErr, context.Canceled) {
 				r.Status = "cancelled"
@@ -97,7 +104,7 @@ func (e *Engine) Advance(parent context.Context, r *Run, sink llm.Sink, checkpoi
 	observer := llm.ObserverFuncs{
 		BeforeFunc: func(c context.Context, request llm.Request) error {
 			observationMu.Lock()
-			if err := c.Err(); err != nil {
+			if err := llm.ContextError(c); err != nil {
 				observationMu.Unlock()
 				return err
 			}
@@ -147,7 +154,7 @@ func (e *Engine) Advance(parent context.Context, r *Run, sink llm.Sink, checkpoi
 		}}
 	ctx = llm.WithObserver(ctx, observer)
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := llm.ContextError(ctx); err != nil {
 			return err
 		}
 		if r.Counters.Steps >= r.Limits.MaxSteps || r.Counters.Calls >= r.Limits.MaxCalls {
@@ -159,11 +166,12 @@ func (e *Engine) Advance(parent context.Context, r *Run, sink llm.Sink, checkpoi
 		}
 		decision, err := e.decider.Decide(ctx, view)
 		if err != nil {
-			code := llm.AsError(err).Code
-			if ctx.Err() != nil {
-				return ctx.Err()
+			ue := llm.AsError(err)
+			code := ue.Code
+			if ce := llm.ContextError(ctx); ce != nil {
+				return ce
 			}
-			if code == "storage_unavailable" || code == "conflict" || code == "budget_exhausted" {
+			if ue.Control || code == "storage_unavailable" || code == "conflict" || code == "budget_exhausted" {
 				return err
 			}
 		}
@@ -272,7 +280,7 @@ func (e *Engine) handleTools(ctx context.Context, r *Run, response llm.Response,
 		if call.Executor != "server" {
 			continue
 		}
-		if err := ctx.Err(); err != nil {
+		if err := llm.ContextError(ctx); err != nil {
 			return err
 		}
 		tool, _ := e.tools.get(call.Name)
@@ -280,7 +288,7 @@ func (e *Engine) handleTools(ctx context.Context, r *Run, response llm.Response,
 		if err := save(ctx); err != nil {
 			return err
 		}
-		if err := ctx.Err(); err != nil {
+		if err := llm.ContextError(ctx); err != nil {
 			return err
 		}
 		toolCtx, cancel := context.WithTimeout(ctx, time.Duration(r.Limits.ToolSeconds)*time.Second)
